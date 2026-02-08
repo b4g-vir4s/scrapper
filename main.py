@@ -77,7 +77,6 @@ def run_project(url):
     else:
         print("❌ No text found to visualize.")
 
-# --- EXECUTION ---
-if __name__ == "__main__":
+if __name__ == "__main__": #its a good practice to use this guard to allow for better modularity and potential reuse of functions in other contexts
     target_url = "https://en.wikipedia.org/wiki/Data_science"
     run_project(target_url)
