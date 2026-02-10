@@ -8,7 +8,7 @@ import re
 import nltk
 from nltk.corpus import stopwords
 
-# Ensure stopwords are available
+# Ensure stopworks are downloaded for text cleaning
 nltk.download('stopwords', quiet=True)
 
 def fetch_html(url):
