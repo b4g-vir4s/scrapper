@@ -11,7 +11,7 @@ from nltk.corpus import stopwords
 # Ensure stopworks are downloaded for text cleaning
 nltk.download('stopwords', quiet=True)
 
-def fetch_html(url):
+def fetching_html(url):
     """Fetches the raw HTML content from a URL."""
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -68,7 +68,7 @@ def run_project(url):
     print(f"🚀 Processing: {url}")
     
     # Functional pipeline flow
-    html_content = fetch_html(url)
+    html_content = fetching_html(url)
     raw_text = extract_text(html_content)
     processed_text = clean_text(raw_text)
     
