@@ -1,58 +1,55 @@
-import requests
-from bs4 import BeautifulSoup
-import re
-from wordcloud import WordCloud, STOPWORDS
-import matplotlib.pyplot as plt
-from collections import Counter
+import scraper, threat_detector, threat_analyzer, text_processor, validators
+from fpdf import FPDF
+from datetime import datetime
+from typing import Dict, Any
 
-# --- PURE FUNCTIONS ---
+class CyberPulseEngine:
+    @staticmethod
+    def process_scan(url: str, selectors: Dict[str, bool]) -> Dict[str, Any]:
+        valid, msg = validators.validate_url(url)
+        if not valid: return {'status': 'failed', 'error': msg}
 
-def fetch_source(url, headers=None):
-    """Fetches raw HTML. Returns (html, status_code)."""
-    try:
-        res = requests.get(url, headers=headers or {'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        return res.text, res.status_code
-    except Exception as e:
-        return str(e), 500
+        raw = scraper.fetch_content(url)
+        if raw['status'] == 'failed': return raw
 
-def parse_elements(html, selector_flags):
-    """Extracts specific data based on GUI checkboxes."""
-    soup = BeautifulSoup(html, 'html.parser')
-    extracted = {}
-    
-    if selector_flags.get("Text"):
-        extracted["text"] = " ".join([t.get_text() for t in soup.find_all(['p', 'h1', 'h2', 'h3'])])
-    if selector_flags.get("Links"):
-        extracted["links"] = [a.get('href') for a in soup.find_all('a', href=True)]
-    if selector_flags.get("Images"):
-        extracted["images"] = [img.get('src') for img in soup.find_all('img', src=True)]
-    if selector_flags.get("Metadata"):
-        extracted["meta"] = {m.get('name'): m.get('content') for m in soup.find_all('meta') if m.get('name')}
-        
-    return extracted
+        findings = threat_detector.extract_all_threats(raw['text'])
+        findings['threat_analysis'] = threat_analyzer.analyze_threats(findings)
 
-def cyber_sanitizer(text, custom_regex=None):
-    """Cleans text and extracts Cyber Indicators (IPs, CVEs)."""
-    # Standard cleaning
-    words = re.findall(r'\b[a-z]{3,}\b', text.lower())
-    
-    # Advanced Extraction: IPs and CVEs
-    ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
-    cve_pattern = r'CVE-\d{4}-\d{4,7}'
-    
-    indicators = {
-        "ips": re.findall(ip_pattern, text),
-        "cves": re.findall(cve_pattern, text)
-    }
-    
-    clean_text = " ".join([w for w in words if w not in STOPWORDS])
-    return clean_text, indicators
+        return {
+            'status': 'success', 'url': url, 'title': raw['title'],
+            'threat_indicators': findings,
+            'parsed_data': {k: raw[k.lower()] if selectors.get(k) else ([] if k != 'Text' else "") 
+                            for k in ['Text', 'Links', 'Images', 'Metadata']},
+            'clean_text': text_processor.sanitize_for_wordcloud(raw['text']),
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
 
-def generate_report_viz(text, theme_color="viridis"):
-    """Generates the Word Cloud object."""
-    return WordCloud(
-        width=1200, height=600,
-        background_color="#0a0a0a",
-        colormap=theme_color,
-        max_words=150
-    ).generate(text)
+    @staticmethod
+    def export_to_pdf(data: Dict, path: str) -> bool:
+        try:
+            pdf = FPDF(); pdf.add_page()
+            # Header
+            pdf.set_fill_color(26, 26, 46); pdf.rect(0, 0, 210, 40, 'F')
+            pdf.set_text_color(255, 255, 255); pdf.set_font("Courier", 'B', 24)
+            pdf.cell(0, 15, "CYBER-PULSE PRO", 1, 1, 'C')
+            # Summary Box
+            ans = data['threat_indicators']['threat_analysis']
+            pdf.set_text_color(0); pdf.set_font("Arial", 'B', 12); pdf.ln(25)
+            pdf.cell(0, 10, f"Target: {data['url']} | {data['timestamp']}", 1, 1)
+            pdf.set_fill_color(240); pdf.rect(10, 65, 190, 25, 'F')
+            pdf.set_xy(15, 68); pdf.cell(0, 10, f"LEVEL: {ans['threat_level']} (Score: {ans['total_score']})")
+            # Findings
+            pdf.set_xy(10, 95); pdf.set_font("Arial", 'B', 14); pdf.cell(0, 10, "Indicators", 0, 1)
+            inds = data['threat_indicators']
+            for lbl, key in {"IPs": "ips", "CVEs": "cves", "BTC": "btc_addresses", "Malware": "malware_keywords"}.items():
+                if inds.get(key):
+                    pdf.set_font("Arial", 'B', 10); pdf.cell(0, 8, f"> {lbl}:", 0, 1)
+                    pdf.set_font("Courier", '', 9)
+                    for item in inds[key][:15]: pdf.cell(0, 5, f" - {item}", 0, 1)
+            pdf.output(path); return True
+        except: return False
+
+# UI Mappings
+process_scan = CyberPulseEngine.process_scan
+export_results = lambda d, f, p: CyberPulseEngine.export_to_pdf(d, p)
+validate_url = validators.validate_url
