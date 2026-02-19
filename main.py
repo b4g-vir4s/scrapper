@@ -67,4 +67,4 @@ class CyberPulseApp(ctk.CTk):
 
 if __name__ == "__main__":
     os.makedirs("intelligence_reports", exist_ok=True)
-    CyberPulseApp().mainloop()
+    CyberPulseApp()
