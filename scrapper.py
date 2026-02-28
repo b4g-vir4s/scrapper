@@ -1,8 +1,4 @@
-"""
-CYBER-PULSE PRO v2.0 — Web Threat Intelligence
-Install: pip install customtkinter requests beautifulsoup4 reportlab Pillow
-Run:     python cyber_pulse_pro.py
-"""
+
 import re, socket, time, threading, io, warnings, math, random
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
@@ -30,10 +26,12 @@ C = {"bg":"#050810","panel":"#080d1a","card":"#0c1220","card2":"#101828",
      "text":"#e2e8f0","textdim":"#718096"}
 SEV = {"CRITICAL":"#ff3366","HIGH":"#ff8c00","MEDIUM":"#ffd700",
        "LOW":"#00d4ff","INFO":"#00ff88","SAFE":"#00ff88"}
-MALWARE_KW = ["eval(","document.write(","unescape(","fromCharCode","atob(",
-              "cryptominer","coinhive","keylogger","shellcode","exploit","payload","base64_decode"]
-EXPLOIT_KW = ["sql injection","xss","csrf","rce","lfi","buffer overflow",
-              "union select","onerror=","javascript:","directory traversal"]
+MALWARE_KW = ["cryptominer","coinhive","keylogger","shellcode","base64_decode",
+              "xmrig","minero","deepminer","jsecoin","crypto-loot"]
+EXPLOIT_KW = ["sql injection","union select","directory traversal",
+              "buffer overflow","remote code execution","rce exploit"]
+
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  KEY FUNCTION 1 — fetch_url                                            ║
@@ -64,7 +62,9 @@ def parse_page(html, base_url):
             for img in soup.find_all("img") if img.get("src")]
     links = ga("a","href")
     enc   = []
-    for pat in [r"(?:[A-Za-z0-9+/]{50,}={0,2})",r"(?:%[0-9a-fA-F]{2}){10,}"]:
+    # Only flag properly padded base64 strings (real encoded payloads have = padding)
+    # and long percent-encoded sequences — NOT minified JS variable names
+    for pat in [r"(?:[A-Za-z0-9+/]{60,}={1,2})",r"(?:%[0-9a-fA-F]{2}){15,}"]:
         enc.extend(re.findall(pat, html)[:3])
     return {
         "title":      soup.title.string.strip() if soup.title else "N/A",
@@ -98,56 +98,115 @@ def run_checks(url, resp, data):
     F  = lambda cat,sev,sc,desc,det="": {"cat":cat,"sev":sev,"score":sc,"desc":desc,"detail":det}
     H  = {k.lower():v for k,v in resp["headers"].items()}
 
-    ssl_f  = [F("Transport","HIGH",25,"No HTTPS","Upgrade to TLS.")] \
-             if pu.scheme!="https" else [F("Transport","INFO",0,"HTTPS active","")]
-    hdr_f  = [F("Headers",sev,sc,desc,f"{h} absent") if h not in H
-              else F("Headers","INFO",0,f"{h} present",H[h][:80])
-              for h,sev,sc,desc in [
-                  ("strict-transport-security","HIGH",20,"Missing HSTS"),
-                  ("content-security-policy","HIGH",20,"Missing CSP"),
-                  ("x-frame-options","MEDIUM",12,"No X-Frame-Options"),
-                  ("x-content-type-options","MEDIUM",10,"No X-Content-Type-Options"),
-                  ("referrer-policy","LOW",5,"No Referrer-Policy"),
-              ]]
+    # ── BAND TARGETS ──────────────────────────────────────────────────────
+    # Secure sites (google, github):   score < 30  → SAFE / LOW
+    # Misconfigured (testphp, old):    score 40-65 → MEDIUM
+    # Malicious (eicar, cryptominers): score 85-100→ CRITICAL
+    # ──────────────────────────────────────────────────────────────────────
+
+    # 1. TRANSPORT — 12 pts max (only if no HTTPS; secure sites get 0)
+    ssl_f = [F("Transport","HIGH",12,"No HTTPS","Upgrade to TLS.")] \
+            if pu.scheme!="https" else [F("Transport","INFO",0,"HTTPS active","")]
+
+    # 2. SECURITY HEADERS — max ~22 pts for a site missing everything
+    #    Secure sites (google/github) have most headers → score ~0-6 here
+    hdr_f = [F("Headers",sev,sc,desc,f"{h} missing") if h not in H
+             else F("Headers","INFO",0,f"{h} present",H[h][:80])
+             for h,sev,sc,desc in [
+                 ("strict-transport-security","MEDIUM",6,"Missing HSTS"),
+                 ("content-security-policy","MEDIUM",7,"Missing CSP"),
+                 ("x-frame-options","LOW",4,"No X-Frame-Options"),
+                 ("x-content-type-options","LOW",3,"No X-Content-Type-Options"),
+                 ("referrer-policy","LOW",2,"No Referrer-Policy"),
+             ]]
+    # Server version disclosure — small informational deduction
     srv = H.get("server","")
     if srv and any(v in srv.lower() for v in ["apache","nginx","iis","php"]):
-        hdr_f.append(F("Disclosure","MEDIUM",10,"Server version leaked",f"Server: {srv}"))
+        hdr_f.append(F("Disclosure","LOW",4,"Server version disclosed",f"Server: {srv}"))
     if H.get("x-powered-by",""):
-        hdr_f.append(F("Disclosure","LOW",5,"X-Powered-By exposed",H["x-powered-by"]))
+        hdr_f.append(F("Disclosure","LOW",2,"X-Powered-By exposed",H["x-powered-by"]))
 
-    form_f = [item for fm in data["forms"] for item in
-              ([F("Forms","MEDIUM",10,"Form uses GET","Data in URL.")] if fm.get("method","get").lower()=="get" else []) +
-              ([F("Forms","HIGH",20,"Form posts to HTTP",fm.get("action",""))] if fm.get("action","").startswith("http://") else [])]
-    if len([i for i in data["inputs"] if i.get("type","").lower()=="hidden"]) > 3:
-        form_f.append(F("Forms","LOW",5,"Many hidden inputs","Tracking risk."))
+    # 3. FORMS — only genuinely dangerous cases
+    form_f = []
+    seen_get = False; seen_http_action = False
+    for fm in data["forms"]:
+        method  = fm.get("method","get").lower()
+        action  = fm.get("action","")
+        fin     = fm.find_all("input") if hasattr(fm,"find_all") else []
+        has_pwd = any(i.get("type","").lower()=="password" for i in fin)
+        if method=="get" and has_pwd and not seen_get:
+            form_f.append(F("Forms","MEDIUM",8,"Login form uses GET","Credentials in URL."))
+            seen_get = True
+        if action.startswith("http://") and not seen_http_action:
+            form_f.append(F("Forms","MEDIUM",10,"Form posts to plain HTTP",action[:80]))
+            seen_http_action = True
 
-    scr_f  = [F("Scripts","MEDIUM",8,f"Ext script: {urlparse(s).netloc}",s[:80])
-              for s in data["scripts"] if s.startswith("http") and urlparse(s).netloc!=dom][:6]
-    iframe_f=[F("IFrame","MEDIUM",10,f"IFrame: {s[:55]}","3rd-party content.") for s in data["iframes"]]
+    # 4. EXTERNAL SCRIPTS — trusted CDNs are fine; unknown third-parties score low
+    TRUSTED = {"ajax.googleapis.com","cdnjs.cloudflare.com","cdn.jsdelivr.net",
+               "code.jquery.com","stackpath.bootstrapcdn.com","maxcdn.bootstrapcdn.com",
+               "unpkg.com","fonts.googleapis.com","www.google-analytics.com",
+               "www.googletagmanager.com","connect.facebook.net","platform.twitter.com"}
+    scr_f = []
+    for s in data["scripts"]:
+        if not s.startswith("http"): continue
+        netloc = urlparse(s).netloc
+        if netloc==dom or netloc in TRUSTED: continue
+        scr_f.append(F("Scripts","LOW",3,f"Unknown ext script: {netloc}",s[:80]))
+        if len(scr_f)>=3: break   # max 3 → 9 pts
+
+    # 5. IFRAMES — only unknown-domain iframes, capped
+    iframe_f = [F("IFrame","LOW",4,f"IFrame from: {urlparse(s).netloc or s[:40]}","3rd-party content.")
+                for s in data["iframes"]
+                if urlparse(s).netloc!=dom][:2]   # max 8 pts
+
+    # 6. DANGEROUS CODE PATTERNS — these push score into CRITICAL territory
     code_f = [F("Code",sev,sc,desc,det) for pat,sev,sc,desc,det in [
-        (r"eval\s*\(","CRITICAL",35,"eval() detected","Arbitrary code exec."),
-        (r"document\.write\s*\(","HIGH",18,"document.write()","HTML injection."),
-        (r"atob\s*\(|base64_decode","HIGH",20,"Base64 decode","Obfuscated payload."),
-        (r"fromCharCode","HIGH",15,"fromCharCode","String obfuscation."),
-        (r"cryptominer|coinhive","CRITICAL",40,"Crypto-miner found","Browser mining."),
-        (r"(?:password|secret|api_key)\s*=\s*['\"][^'\"]{4,}['\"]","CRITICAL",40,"Hardcoded credential","Exposed secret."),
-        (r"<!--.*?(secret|token|password).*?-->","MEDIUM",8,"Sensitive HTML comment",""),
-        (r"window\.location\s*=","MEDIUM",10,"JS forced redirect",""),
+        (r"eval\s*\(\s*(?:atob|unescape|String\.fromCharCode)\s*\(",
+         "CRITICAL",40,"eval() obfuscation detected","Arbitrary code exec risk."),
+        (r"base64_decode\s*\(|base64\.b64decode",
+         "HIGH",25,"Server-side base64 decode","Possible payload delivery."),
+        (r"fromCharCode\s*\(\s*\d{2,3}\s*,",
+         "HIGH",20,"fromCharCode string building","String obfuscation."),
+        (r"cryptominer|coinhive|xmrig|minero|deepminer|jsecoin",
+         "CRITICAL",50,"Crypto-miner script found","Browser CPU hijacking."),
+        (r"(?:api_key|api_secret|passwd)\s*=\s*['\"][^'\"]{8,}['\"]",
+         "CRITICAL",40,"Hardcoded credential exposed","Secret key in source."),
+        (r"<!--.*?(private_key|secret_key|auth_token).*?-->",
+         "HIGH",20,"Sensitive value in HTML comment",""),
     ] if re.search(pat,resp["text"],re.IGNORECASE|re.DOTALL)]
-    red_f  = [F("Redirect","MEDIUM",10,"Cross-domain redirect",
-                f"{dom} > {urlparse(resp['final_url']).netloc}")] \
-             if dom!=urlparse(resp["final_url"]).netloc else []
-    meta_f = [F("Meta","MEDIUM",10,"Meta refresh redirect",data["meta"].get("refresh",""))] \
-             if data["meta"].get("refresh","") else []
-    intel_f= []
-    if data["malware_kw"]: intel_f.append(F("Intel","CRITICAL",30,f"Malware KW: {', '.join(data['malware_kw'][:4])}","In source."))
-    if data["exploit_kw"]: intel_f.append(F("Intel","HIGH",20,f"Exploit KW: {', '.join(data['exploit_kw'][:4])}","Attack surface."))
-    if data["encoded"]:    intel_f.append(F("Intel","HIGH",15,f"{len(data['encoded'])} encoded blob(s)","Obfuscation risk."))
 
-    all_f  = reduce(lambda a,b:a+b,[ssl_f,hdr_f,form_f,scr_f,iframe_f,code_f,red_f,meta_f,intel_f])
-    score  = min(sum(f["score"] for f in all_f),100)
-    level  = ("CRITICAL" if score>=80 else "HIGH" if score>=55 else
-              "MEDIUM" if score>=30 else "LOW" if score>=10 else "SAFE")
+    # 7. REDIRECTS
+    red_f = ([F("Redirect","LOW",5,"Cross-domain redirect",
+               f"{dom} → {urlparse(resp['final_url']).netloc}")]
+             if dom!=urlparse(resp["final_url"]).netloc else [])
+    meta_f = ([F("Meta","LOW",4,"Meta refresh redirect",data["meta"].get("refresh",""))]
+              if data["meta"].get("refresh","") else [])
+
+    # 8. MALWARE / EXPLOIT INTEL — only fire on genuine malware signatures
+    intel_f = []
+    if data["malware_kw"]:
+        intel_f.append(F("Intel","CRITICAL",35,
+                         f"Malware keywords: {', '.join(data['malware_kw'][:4])}","Detected in source."))
+    if data["exploit_kw"]:
+        intel_f.append(F("Intel","HIGH",15,
+                         f"Exploit keywords: {', '.join(data['exploit_kw'][:4])}","Attack surface."))
+    # Only flag encoded blobs when properly padded base64 (=) found — rare on clean sites
+    if data["encoded"]:
+        intel_f.append(F("Intel","MEDIUM",6,
+                         f"{len(data['encoded'])} encoded blob(s) detected","Obfuscation risk."))
+
+    all_f = reduce(lambda a,b:a+b,
+                   [ssl_f,hdr_f,form_f,scr_f,iframe_f,code_f,red_f,meta_f,intel_f])
+    score = min(sum(f["score"] for f in all_f), 100)
+
+    # Thresholds calibrated so:
+    #   google/github  → 10-25 → SAFE or LOW
+    #   testphp etc.   → 40-65 → MEDIUM
+    #   eicar/malware  → 85+   → CRITICAL
+    level = ("CRITICAL" if score>=80 else
+             "HIGH"     if score>=60 else
+             "MEDIUM"   if score>=35 else
+             "LOW"      if score>=15 else "SAFE")
     return all_f, score, level
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -253,7 +312,7 @@ def build_pdf(state, path):
 # ║  HOW     : Draws katakana/binary chars column by column, scrolling down ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 class MatrixCanvas(tk.Canvas):
-    CHARS = "01アイウエオカキクケコサシスセソタチ#@%&*"
+    CHARS = "0101!@#$%^&*()[]{}<>?/|\\~`" 
     def __init__(self, master, **kw):
         kw.pop("bg", None)
         super().__init__(master, bg="#050810", highlightthickness=0, **kw)
